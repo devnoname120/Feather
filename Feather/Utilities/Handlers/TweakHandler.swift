@@ -14,11 +14,18 @@ class TweakHandler {
 	private let _fileManager = FileManager.default
 	private var _urlsToInject: [URL] = []
 	private var _directoriesToCheck: [URL] = []
-	private var _injectedDylibNames: [String] = []
+	private var _injectedDylibs: [InjectedDylib] = []
 
 	private let _app: URL
 	private var _options: Options
 	private var _urls: [URL]
+
+	private var _targetPlanner: TweakInjectionTargetPlanner {
+		TweakInjectionTargetPlanner(
+			injectPath: .init(rawValue: _options.injectPath.rawValue) ?? .executablePath,
+			injectFolder: .init(rawValue: _options.injectFolder.rawValue) ?? .frameworks
+		)
+	}
 
 	init(
 		app: URL,
@@ -97,8 +104,8 @@ class TweakHandler {
 		}
 
 		// inject into all extensions if enabled
-		if _options.injectIntoExtensions && !_injectedDylibNames.isEmpty {
-			_injectIntoAllExtensions(dylibNames: _injectedDylibNames)
+		if _options.injectIntoExtensions && !_injectedDylibs.isEmpty {
+			_injectIntoAllExtensions(dylibs: _injectedDylibs)
 		}
 	}
 	
@@ -123,26 +130,9 @@ class TweakHandler {
 	
 	// Inject imported dylib file
 	private func _handleDylib(at url: URL) async throws {
-		var destinationURL = _app
-		var injectFolder = _options.injectFolder
-		
-		// check for "/Frameworks/", then append the destinationUrl
-		if _options.injectFolder == .frameworks {
-			destinationURL = destinationURL.appendingPathComponent("Frameworks")
-		}
-		
-		// We check for "@rpath" and "/Frameworks/", if they're both enabled force
-		// the inject folder to be root "/" instead, as the @rpath is already in
-		// frameworks
-		if
-			_options.injectPath == .rpath && _options.injectFolder == .frameworks
-		{
-			injectFolder = .root
-		}
-		
-		destinationURL = destinationURL.appendingPathComponent(url.lastPathComponent)
-		
-		
+		let planner = _targetPlanner
+		let destinationURL = planner.dylibDestination(in: _app, dylibName: url.lastPathComponent)
+
 		try _fileManager.moveFileIfNeeded(from: url, to: destinationURL)
 		
 		guard let appexe = Bundle(url: _app)?.executableURL else {
@@ -161,10 +151,10 @@ class TweakHandler {
 		// inject if there's a valid app main executable
 		_ = Zsign.injectDyLib(
 			appExecutable: appexe.path,
-			with: "\(_options.injectPath.rawValue)\(injectFolder.rawValue)\(destinationURL.lastPathComponent)"
+			with: planner.loadPathForBundleExecutable(dylibName: destinationURL.lastPathComponent)
 		)
 
-		_injectedDylibNames.append(destinationURL.lastPathComponent)
+		_injectedDylibs.append(.init(url: destinationURL))
 	}
 	
 	// Inject imported framework dir
@@ -258,67 +248,74 @@ class TweakHandler {
 		}
 	}
 
-	// Discovers all .appex bundles in the app's PlugIns and Extensions directories
-	private func _discoverAppExtensions() -> [URL] {
-		var extensions: [URL] = []
-		
-		let plugInsPath = _app.appendingPathComponent("PlugIns")
-		let extensionsPath = _app.appendingPathComponent("Extensions")
-		
-		for directory in [plugInsPath, extensionsPath] {
-			guard _fileManager.fileExists(atPath: directory.path) else { continue }
-			
-			do {
-				let contents = try _fileManager.contentsOfDirectory(
-					at: directory,
-					includingPropertiesForKeys: nil,
-					options: [.skipsHiddenFiles]
-				)
-				
-				let appexBundles = contents.filter { url in
-					url.pathExtension.lowercased() == "appex" && url.hasDirectoryPath
-				}
-				
-				extensions.append(contentsOf: appexBundles)
-			} catch {
-				Logger.misc.warning("Failed to enumerate \(directory.path): \(error.localizedDescription)")
-			}
-		}
-		
-		return extensions
+	private func _discoverAppExtensions(in bundleURL: URL) -> [URL] {
+		_targetPlanner.directAppExtensions(in: bundleURL, fileManager: _fileManager)
 	}
 
-	// Injects a dylib into an extension's executable
+	private func _discoverWatchApps() -> [URL] {
+		_targetPlanner.watchApps(in: _app, fileManager: _fileManager)
+	}
+
+	@discardableResult
+	private func _copyInjectedDylib(_ dylib: InjectedDylib, into bundleURL: URL) -> Bool {
+		let destinationURL = _targetPlanner.dylibDestination(
+			in: bundleURL,
+			dylibName: dylib.name
+		)
+
+		if destinationURL.path == dylib.url.path {
+			return true
+		}
+
+		do {
+			try _fileManager.createDirectoryIfNeeded(at: destinationURL.deletingLastPathComponent())
+
+			if !_fileManager.fileExists(atPath: destinationURL.path) {
+				try _fileManager.copyItem(at: dylib.url, to: destinationURL)
+			}
+
+			return true
+		} catch {
+			Logger.misc.warning("Failed to copy \(dylib.name) into \(bundleURL.lastPathComponent): \(error.localizedDescription)")
+			return false
+		}
+	}
+
+	private func _injectIntoBundleExecutable(bundleURL: URL, dylibName: String, description: String) {
+		guard
+			let bundle = Bundle(url: bundleURL),
+			let executableURL = bundle.executableURL
+		else {
+			Logger.misc.warning("Skipping \(bundleURL.lastPathComponent): couldn't read bundle")
+			return
+		}
+
+		let success = Zsign.injectDyLib(
+			appExecutable: executableURL.path,
+			with: _targetPlanner.loadPathForBundleExecutable(dylibName: dylibName)
+		)
+
+		if success {
+			Logger.misc.info("Injected \(dylibName) into \(description): \(bundleURL.lastPathComponent)")
+		} else {
+			Logger.misc.warning("Failed to inject \(dylibName) into \(description): \(bundleURL.lastPathComponent)")
+		}
+	}
+
 	private func _injectIntoExtension(extensionURL: URL, dylibName: String) {
-		guard 
+		guard
 			let extensionBundle = Bundle(url: extensionURL),
-			let extensionExecutable = extensionBundle.executableURL 
+			let extensionExecutable = extensionBundle.executableURL
 		else {
 			Logger.misc.warning("Skipping \(extensionURL.lastPathComponent): couldn't read bundle")
 			return
 		}
-		
-		var injectFolder = _options.injectFolder
-		if _options.injectPath == .rpath && _options.injectFolder == .frameworks {
-			injectFolder = .root
-		}
-		
-		let injectPath: String
-		if _options.injectPath == .rpath {
-			injectPath = "@rpath/\(dylibName)"
-		} else {
-			if injectFolder == .frameworks {
-				injectPath = "@executable_path/../../Frameworks/\(dylibName)"
-			} else {
-				injectPath = "@executable_path/../../\(dylibName)"
-			}
-		}
-		
+
 		let success = Zsign.injectDyLib(
 			appExecutable: extensionExecutable.path,
-			with: injectPath
+			with: _targetPlanner.loadPathForExtensionExecutable(dylibName: dylibName)
 		)
-		
+
 		if success {
 			Logger.misc.info("Injected \(dylibName) into extension: \(extensionURL.lastPathComponent)")
 		} else {
@@ -326,23 +323,75 @@ class TweakHandler {
 		}
 	}
 
-	// Injects all dylibs into all discovered extensions
-	private func _injectIntoAllExtensions(dylibNames: [String]) {
-		let extensions = _discoverAppExtensions()
+	private func _injectIntoChildExtensions(in bundleURL: URL, dylibs: [InjectedDylib], recursive: Bool) {
+		let extensions = _discoverAppExtensions(in: bundleURL)
 
-		guard !extensions.isEmpty else {
-			Logger.misc.info("No app extensions found for injection")
+		for extensionURL in extensions {
+			for dylib in dylibs {
+				_injectIntoExtension(extensionURL: extensionURL, dylibName: dylib.name)
+			}
+
+			guard recursive else {
+				continue
+			}
+
+			for dylib in dylibs {
+				_copyInjectedDylib(dylib, into: extensionURL)
+			}
+
+			_injectIntoChildExtensions(in: extensionURL, dylibs: dylibs, recursive: true)
+		}
+	}
+
+	private func _injectIntoWatchApps(dylibs: [InjectedDylib]) {
+		let watchApps = _discoverWatchApps()
+
+		guard !watchApps.isEmpty else {
+			Logger.misc.info("No watchOS apps found for injection")
 			return
 		}
 
-		Logger.misc.info("Found \(extensions.count) app extension(s) for injection")
+		Logger.misc.info("Found \(watchApps.count) watchOS app(s) for injection")
 
-		for extensionURL in extensions {
-			for dylibName in dylibNames {
-				_injectIntoExtension(extensionURL: extensionURL, dylibName: dylibName)
+		for watchApp in watchApps {
+			for dylib in dylibs {
+				guard _copyInjectedDylib(dylib, into: watchApp) else {
+					continue
+				}
+
+				_injectIntoBundleExecutable(
+					bundleURL: watchApp,
+					dylibName: dylib.name,
+					description: "watchOS app"
+				)
 			}
+
+			_injectIntoChildExtensions(in: watchApp, dylibs: dylibs, recursive: true)
 		}
 	}
+
+	private func _injectIntoAllExtensions(dylibs: [InjectedDylib]) {
+		let extensions = _discoverAppExtensions(in: _app)
+
+		if extensions.isEmpty {
+			Logger.misc.info("No app extensions found for injection")
+		} else {
+			Logger.misc.info("Found \(extensions.count) app extension(s) for injection")
+
+			for extensionURL in extensions {
+				for dylib in dylibs {
+					_injectIntoExtension(extensionURL: extensionURL, dylibName: dylib.name)
+				}
+			}
+		}
+
+		_injectIntoWatchApps(dylibs: dylibs)
+	}
+}
+
+private struct InjectedDylib {
+	let url: URL
+	var name: String { url.lastPathComponent }
 }
 
 // MARK: - Find correct files in debs
